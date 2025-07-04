@@ -1,0 +1,13 @@
+[server]
+enableXsrfProtection = false
+enableCORS = false
+allowRunOnSave = true
+
+[browser]
+gatherUsageStats = false
+
+[global]
+suppressDeprecationWarnings = true
+
+[theme]
+base = "light"
