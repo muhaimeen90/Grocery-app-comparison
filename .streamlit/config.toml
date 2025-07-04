@@ -9,5 +9,3 @@ gatherUsageStats = false
 [global]
 suppressDeprecationWarnings = true
 
-[theme]
-base = "light"
