@@ -61,8 +61,9 @@ def normalize_product_title(title):
         r'\bkg\b': 'kilogram',
         r'\boz\b': 'ounce',
         r'\blb\b': 'pound',
-        r'\bx\s*(\d+)': r'pack of \1',
-        r'(\d+)\s*x\s*(\d+)': r'\1 pack of \2',
+        # Remove the problematic X replacements that interfere with size extraction
+        # r'\bx\s*(\d+)': r'pack of \1',
+        # r'(\d+)\s*x\s*(\d+)': r'\1 pack of \2',
         r'\&': 'and',
         r'\bw\/': 'with',
         r'\bw\b': 'with'
@@ -104,15 +105,31 @@ def extract_size_and_clean_title(title):
         (r'\b(\d+)\s+pack(?:s)?\s+of\s+(\d+(?:\.\d+)?)\s*(millilitre|ml|litre|l|gram|g|kilogram|kg)',
          lambda m: f"{m.group(2)}{m.group(3)}x{m.group(1)}"),
         
-        # Size x count: "375ml x 6" or "375ml x6"
+        # Size x count: "375ml x 6", "375ml x6", "375ml X 24"
         (r'\b(\d+(?:\.\d+)?)\s*(millilitre|ml|litre|l|gram|g|kilogram|kg)\s*[xX×]\s*(\d+)',
          lambda m: f"{m.group(1)}{m.group(2)}x{m.group(3)}"),
         
-        # Count x size: "6 x 375ml"
+        # Count x size: "6 x 375ml", "24 X 375ml"
         (r'\b(\d+)\s*[xX×]\s*(\d+(?:\.\d+)?)\s*(millilitre|ml|litre|l|gram|g|kilogram|kg)',
          lambda m: f"{m.group(2)}{m.group(3)}x{m.group(1)}"),
         
-        # Simple size: "375ml", "1.25l", "45g"
+        # Size with pack mention (various formats): "375ml 24 pack", "375ml X 24 Pack", "375ml multipack 24"
+        (r'\b(\d+(?:\.\d+)?)\s*(millilitre|ml|litre|l|gram|g|kilogram|kg)\s*(?:x|X|×)?\s*(?:multipack)?\s*(?:cans?)?\s*(\d+)\s*pack',
+         lambda m: f"{m.group(1)}{m.group(2)}x{m.group(3)}"),
+        
+        # Pack with size mention: "24 pack 375ml", "24 Pack X 375ml", "24 multipack 375ml"
+        (r'\b(\d+)\s*(?:pack|multipack)\s*(?:x|X|×)?\s*(?:cans?)?\s*(\d+(?:\.\d+)?)\s*(millilitre|ml|litre|l|gram|g|kilogram|kg)',
+         lambda m: f"{m.group(2)}{m.group(3)}x{m.group(1)}"),
+        
+        # Alternative multipack format: "Multipack Cans 375ml X 24 Pack"
+        (r'\bmultipack\s+cans?\s+(\d+(?:\.\d+)?)\s*(millilitre|ml|litre|l|gram|g|kilogram|kg)\s*[xX×]\s*(\d+)\s*pack',
+         lambda m: f"{m.group(1)}{m.group(2)}x{m.group(3)}"),
+        
+        # Another alternative: "Cans 375ml X 24 Pack"
+        (r'\bcans?\s+(\d+(?:\.\d+)?)\s*(millilitre|ml|litre|l|gram|g|kilogram|kg)\s*[xX×]\s*(\d+)\s*pack',
+         lambda m: f"{m.group(1)}{m.group(2)}x{m.group(3)}"),
+        
+        # Simple size: "375ml", "1.25l", "45g" (must come after multipack patterns)
         (r'\b(\d+(?:\.\d+)?)\s*(millilitre|ml|litre|l|gram|g|kilogram|kg|ounce|oz|pound|lb)',
          lambda m: f"{m.group(1)}{m.group(2)}"),
         
@@ -272,26 +289,94 @@ def normalize_brand_name_fuzzy(brand):
 
 def create_product_signature(row):
     """
-    Creating a text signature for product matching using key attributes.
-    This combines brand, product title, and size information.
+    Creating a text signature for product matching using only the cleaned product title.
+    This is used for the final similarity comparison after strict filtering.
     """
-    signature_parts = []
-    
-    # Add brand name 
-    if pd.notna(row.get('brandName', '')) and row.get('brandName', '').strip():
-        signature_parts.append(str(row['brandName']).strip())
-    
-    # Add cleaned product title
+    # Only use cleaned product title for similarity comparison
     if pd.notna(row.get('productTitle', '')) and row.get('productTitle', '').strip():
-        signature_parts.append(str(row['productTitle']).strip())
+        return str(row['productTitle']).strip().lower()
+    return ""
+
+def normalize_brand_for_matching(brand):
+    """
+    Normalize brand name specifically for exact matching.
+    More aggressive normalization for brand comparison.
+    """
+    if pd.isna(brand) or not brand.strip():
+        return ""
     
-    # Add size information (important for exact matching)
-    if pd.notna(row.get('size', '')) and row.get('size', '').strip():
-        signature_parts.append(str(row['size']).strip())
+    # Clean and normalize
+    cleaned = str(brand).strip().lower()
+    cleaned = re.sub(r'[^\w\s]', '', cleaned)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     
-    # Join with spaces to create signature
-    signature = ' '.join(signature_parts)
-    return signature.lower().strip()
+    # Remove common suffixes and prefixes
+    cleaned = re.sub(r'\b(co|company|ltd|limited|inc|corp|corporation)\b', '', cleaned)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    
+    # Handle common variations
+    brand_variations = {
+        'coca cola': 'coca-cola',
+        'cocacola': 'coca-cola',
+        'coke': 'coca-cola',
+        'pepsi cola': 'pepsi',
+        'mountain dew': 'mountain-dew',
+        'dr pepper': 'dr-pepper',
+        'seven up': '7-up',
+        '7up': '7-up'
+    }
+    
+    return brand_variations.get(cleaned, cleaned)
+
+def normalize_size_for_matching(size):
+    """
+    Normalize size field for exact matching.
+    """
+    if pd.isna(size) or not size.strip():
+        return ""
+    
+    size_str = str(size).strip().lower()
+    
+    # Handle different size formats and convert to standard format
+    # Convert liters to ml for consistency
+    size_str = re.sub(r'(\d+(?:\.\d+)?)\s*l\b', lambda m: f"{int(float(m.group(1)) * 1000)}ml", size_str)
+    size_str = re.sub(r'(\d+(?:\.\d+)?)\s*litre', lambda m: f"{int(float(m.group(1)) * 1000)}ml", size_str)
+    
+    # Convert kg to g for consistency
+    size_str = re.sub(r'(\d+(?:\.\d+)?)\s*kg\b', lambda m: f"{int(float(m.group(1)) * 1000)}g", size_str)
+    size_str = re.sub(r'(\d+(?:\.\d+)?)\s*kilogram', lambda m: f"{int(float(m.group(1)) * 1000)}g", size_str)
+    
+    # Standardize pack notation
+    size_str = re.sub(r'(\d+)\s*-?\s*pack', r'\1-pack', size_str)
+    
+    # Remove extra spaces
+    size_str = re.sub(r'\s+', '', size_str)
+    
+    return size_str
+
+def brands_match_fuzzy(brand1, brand2, threshold=85):
+    """
+    Check if two brands match using fuzzy string matching with partial matching.
+    """
+    if not brand1 or not brand2:
+        return False
+    
+    # Normalize both brands
+    norm_brand1 = normalize_brand_for_matching(brand1)
+    norm_brand2 = normalize_brand_for_matching(brand2)
+    
+    # Exact match first
+    if norm_brand1 == norm_brand2:
+        return True
+    
+    # Partial ratio matching (good for "coca" vs "coca-cola")
+    partial_similarity = fuzz.partial_ratio(norm_brand1, norm_brand2)
+    if partial_similarity >= threshold:
+        return True
+    
+    # Regular fuzzy match
+    similarity = fuzz.ratio(norm_brand1, norm_brand2)
+    return similarity >= threshold
 
 @st.cache_resource
 def load_sentence_transformer():
@@ -300,62 +385,104 @@ def load_sentence_transformer():
 
 def find_identical_products_across_stores(input_row, dataframe):
     """
-    Find identical products across different stores using vector embeddings and cosine similarity.
+    Find identical products across different stores using a hybrid approach:
+    1. Strict filtering based on brand and size
+    2. Similarity scoring on product title only
+    3. High threshold for final matches
     """
     model = load_sentence_transformer()
     
-    # Create signature for input product
-    input_signature = create_product_signature(input_row)
+    # Get input product details
     input_store = input_row.get('shop', 'Unknown')
+    input_brand = input_row.get('brandName', '')
+    input_size = input_row.get('size', '')
+    input_title = input_row.get('productTitle', '')
     
-    if not input_signature:
-        return {'near_identical': [], 'closely_related': [], 'total_matches': 0}
+    # Normalize input attributes for matching
+    input_brand_norm = normalize_brand_for_matching(input_brand)
+    input_size_norm = normalize_size_for_matching(input_size)
+    input_signature = create_product_signature(input_row)
+    
+    if not input_signature or not input_brand_norm or not input_size_norm:
+        return {'most_identical': [], 'closely_related': [], 'total_matches': 0}
     
     # Filter out products from the same store
     other_stores_df = dataframe[dataframe['shop'] != input_store].copy()
     
     if len(other_stores_df) == 0:
-        return {'near_identical': [], 'closely_related': [], 'total_matches': 0}
+        return {'most_identical': [], 'closely_related': [], 'total_matches': 0}
     
-    # Create signatures for all products from other stores
-    other_signatures = other_stores_df.apply(create_product_signature, axis=1).tolist()
+    # Step 1: Strict Filtering - Brand and Size must match
+    print(f"Starting with {len(other_stores_df)} products from other stores")
     
-    # Remove empty signatures
-    valid_indices = [i for i, sig in enumerate(other_signatures) if sig.strip()]
-    if not valid_indices:
-        return {'near_identical': [], 'closely_related': [], 'total_matches': 0}
+    # Filter by brand (fuzzy matching)
+    brand_candidates = []
+    for idx, row in other_stores_df.iterrows():
+        candidate_brand = row.get('brandName', '')
+        if brands_match_fuzzy(input_brand, candidate_brand):
+            brand_candidates.append(idx)
     
-    valid_other_df = other_stores_df.iloc[valid_indices].copy()
-    valid_signatures = [other_signatures[i] for i in valid_indices]
+    if not brand_candidates:
+        print("No brand matches found")
+        return {'most_identical': [], 'closely_related': [], 'total_matches': 0}
     
-    # Generate embeddings
+    brand_filtered_df = other_stores_df.loc[brand_candidates].copy()
+    print(f"After brand filtering: {len(brand_filtered_df)} products")
+    
+    # Filter by size (exact matching)
+    size_candidates = []
+    for idx, row in brand_filtered_df.iterrows():
+        candidate_size = row.get('size', '')
+        candidate_size_norm = normalize_size_for_matching(candidate_size)
+        if candidate_size_norm == input_size_norm:
+            size_candidates.append(idx)
+    
+    if not size_candidates:
+        print("No size matches found after brand filtering")
+        return {'most_identical': [], 'closely_related': [], 'total_matches': 0}
+    
+    final_candidates_df = other_stores_df.loc[size_candidates].copy()
+    print(f"After size filtering: {len(final_candidates_df)} products")
+    
+    # Step 2: Similarity Scoring on Product Title Only
     try:
-        # Combine input signature with all other signatures for batch processing
-        all_signatures = [input_signature] + valid_signatures
+        # Create signatures for remaining candidates (title only)
+        candidate_signatures = []
+        valid_candidates = []
+        
+        for idx, row in final_candidates_df.iterrows():
+            signature = create_product_signature(row)
+            if signature.strip():
+                candidate_signatures.append(signature)
+                valid_candidates.append(idx)
+        
+        if not candidate_signatures:
+            return {'most_identical': [], 'closely_related': [], 'total_matches': 0}
+        
+        # Generate embeddings for input and candidates
+        all_signatures = [input_signature] + candidate_signatures
         embeddings = model.encode(all_signatures)
         
-        # Separate input embedding from other embeddings
+        # Calculate similarities
         input_embedding = embeddings[0].reshape(1, -1)
-        other_embeddings = embeddings[1:]
+        candidate_embeddings = embeddings[1:]
+        similarities = cosine_similarity(input_embedding, candidate_embeddings)[0]
         
-        # Calculate cosine similarities
-        similarities = cosine_similarity(input_embedding, other_embeddings)[0]
+        high_threshold = 0.85  
         
-        # Categorize matches by similarity levels
-        near_identical_matches = []  # 95%+ similarity
-        closely_related_matches = []  # 80-95% similarity
+        most_identical_matches = []
+        closely_related_matches = []
         
         for idx, similarity_score in enumerate(similarities):
-            if similarity_score >= 0.95:  # 95%+ = Near-identical
-                match_category = "near_identical"
-                matches_list = near_identical_matches
-            elif similarity_score >= 0.80:  # 80-95% = Closely related
-                match_category = "closely_related" 
-                matches_list = closely_related_matches
+            if similarity_score >= high_threshold:
+                match_category = "most_identical"
+                matches_list = most_identical_matches
             else:
-                continue  # Skip matches below 80%
+                match_category = "closely_related"
+                matches_list = closely_related_matches
             
-            matching_row = valid_other_df.iloc[idx]
+            candidate_idx = valid_candidates[idx]
+            matching_row = other_stores_df.loc[candidate_idx]
             
             match_info = {
                 'product_title': matching_row.get('productTitle', 'N/A'),
@@ -367,24 +494,45 @@ def find_identical_products_across_stores(input_row, dataframe):
                 'subcategory': matching_row.get('subCategoryName', 'N/A'),
                 'similarity_score': round(similarity_score, 4),
                 'match_category': match_category,
-                'signature': valid_signatures[idx]
+                'signature': candidate_signatures[idx]
             }
             matches_list.append(match_info)
         
-        # Sort each category by similarity score (highest first)
-        near_identical_matches.sort(key=lambda x: x['similarity_score'], reverse=True)
+        # Sort matches by similarity score
+        most_identical_matches.sort(key=lambda x: x['similarity_score'], reverse=True)
         closely_related_matches.sort(key=lambda x: x['similarity_score'], reverse=True)
         
-        # Return categorized results
+        # Filter to keep only the highest scoring match per store
+        def keep_best_match_per_store(matches):
+            """Keep only the match with highest similarity score per store"""
+            store_best_matches = {}
+            for match in matches:
+                store = match['store']
+                if store not in store_best_matches or match['similarity_score'] > store_best_matches[store]['similarity_score']:
+                    store_best_matches[store] = match
+            return list(store_best_matches.values())
+        
+        # Apply filtering to both categories
+        most_identical_matches = keep_best_match_per_store(most_identical_matches)
+        closely_related_matches = keep_best_match_per_store(closely_related_matches)
+        
+        total_matches = len(most_identical_matches) + len(closely_related_matches)
+        print(f"Final matches found: {total_matches} (Most identical: {len(most_identical_matches)}, Closely related: {len(closely_related_matches)})")
+        # Print similarity scores for most identical matches
+        if most_identical_matches:
+            print("\n=== Most Identical Products similarity) ===")
+            for match in most_identical_matches:
+                print(f"Store: {match['store']}, Similarity: {match['similarity_score']:.4f}")
+
         return {
-            'near_identical': near_identical_matches,
+            'most_identical': most_identical_matches,
             'closely_related': closely_related_matches,
-            'total_matches': len(near_identical_matches) + len(closely_related_matches)
+            'total_matches': total_matches
         }
         
     except Exception as e:
-        st.error(f"Error generating embeddings: {e}")
-        return {'near_identical': [], 'closely_related': [], 'total_matches': 0}
+        st.error(f"Error in similarity calculation: {e}")
+        return {'most_identical': [], 'closely_related': [], 'total_matches': 0}
 
 @st.cache_data
 def load_and_process_data():
@@ -427,20 +575,36 @@ def load_and_process_data():
     if 'brandName' in combined_df.columns:
         combined_df['brandName'] = combined_df['brandName'].apply(normalize_brand_name_fuzzy)
     
+    # Write the modified dataset to output.csv
+    combined_df.to_csv('output.csv', index=False)
+    
     return combined_df
 
 def display_matches_in_streamlit(matches, input_product):
-    """Display matching products in Streamlit format"""
+    """Display matching products in Streamlit format with enhanced information"""
     
     if matches['total_matches'] > 0:
-        st.success(f" Found {matches['total_matches']} matching products in other stores!")
+        st.success(f"🎯 Found {matches['total_matches']} highly accurate matches in other stores!")
         
-        # Display Near-Identical Products (95%+)
-        if matches['near_identical']:
-            st.subheader(f" Near-Identical Products (95%+ similarity) - {len(matches['near_identical'])} found")
+        # Show input product details for reference
+        with st.expander("🔍 Reference Product Details", expanded=False):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.write(f"**Brand:** {input_product.get('brandName', 'N/A')}")
+                st.write(f"**Title:** {input_product.get('productTitle', 'N/A')}")
+            with col2:
+                st.write(f"**Size:** {input_product.get('size', 'N/A')}")
+                st.write(f"**Store:** {input_product.get('shop', 'N/A')}")
+            with col3:
+                st.write(f"**Price:** ${input_product.get('productPrice', 'N/A')}")
+        
+        # Display Most Identical Products (85%+)
+        if matches['most_identical']:
+            st.subheader(f"Identical Products - {len(matches['most_identical'])} found")
+            st.info("These products passed strict brand and size matching")
             
-            for i, match in enumerate(matches['near_identical'], 1):
-                with st.expander(f"#{i} {match['store']} - Similarity: {match['similarity_score']:.1%}", expanded=True):
+            for i, match in enumerate(matches['most_identical'], 1):
+                with st.expander(f"#{i} {match['store']}", expanded=True):
                     col1, col2, col3 = st.columns(3)
                     
                     with col1:
@@ -453,18 +617,33 @@ def display_matches_in_streamlit(matches, input_product):
                         st.write("**Store & Price:**")
                         st.write(f" Store: {match['store']}")
                         st.write(f" Price: ${match['price']}")
+                        
+                        # Calculate price difference
+                        try:
+                            input_price = float(input_product.get('productPrice', 0))
+                            match_price = float(match['price'])
+                            price_diff = match_price - input_price
+                            if price_diff > 0:
+                                st.write(f" +${price_diff:.2f} more expensive")
+                            elif price_diff < 0:
+                                st.write(f" ${abs(price_diff):.2f} cheaper")
+                            else:
+                                st.write("💱 Same price")
+                        except (ValueError, TypeError):
+                            pass
                     
                     with col3:
                         st.write("**Category:**")
                         st.write(f" Category: {match['category']}")
                         st.write(f" Subcategory: {match['subcategory']}")
         
-        # Display Closely Related Products (80-95%)
+        # Display Closely Related Products (candidates that passed filtering)
         if matches['closely_related']:
-            st.subheader(f"🔍 Closely Related Products (80-95% similarity) - {len(matches['closely_related'])} found")
+            st.subheader(f" Closely Related Products (candidates after filtering) - {len(matches['closely_related'])} found")
+            st.info("These products have the same brand and size, but lower title similarity.")
             
             for i, match in enumerate(matches['closely_related'], 1):
-                with st.expander(f"#{i} {match['store']} - Similarity: {match['similarity_score']:.1%}"):
+                with st.expander(f"#{i} {match['store']}"):
                     col1, col2, col3 = st.columns(3)
                     
                     with col1:
@@ -475,26 +654,59 @@ def display_matches_in_streamlit(matches, input_product):
                     
                     with col2:
                         st.write("**Store & Price:**")
-                        st.write(f" Store: {match['store']}")
-                        st.write(f" Price: ${match['price']}")
+                        st.write(f"Store: {match['store']}")
+                        st.write(f"Price: ${match['price']}")
+                        
+                        # Calculate price difference
+                        try:
+                            input_price = float(input_product.get('productPrice', 0))
+                            match_price = float(match['price'])
+                            price_diff = match_price - input_price
+                            if price_diff > 0:
+                                st.write(f" +${price_diff:.2f} more expensive")
+                            elif price_diff < 0:
+                                st.write(f" ${abs(price_diff):.2f} cheaper")
+                            else:
+                                st.write("💱 Same price")
+                        except (ValueError, TypeError):
+                            pass
                     
                     with col3:
                         st.write("**Category:**")
                         st.write(f" Category: {match['category']}")
                         st.write(f" Subcategory: {match['subcategory']}")
     else:
-        st.warning(" No matching products found in other stores with the current threshold.")
+        st.warning(" No highly accurate matches found.")
+        st.info(" This means no products in other stores have the same brand AND size with sufficient title similarity (85%+).")
+        st.markdown("**Possible reasons:**")
+        st.markdown("- Product not available in other stores")
+        st.markdown("- Different product naming conventions")
+        st.markdown("- Different size offerings across stores")
 
 def main():
-    st.title("🛒 Product Matching Across Stores")
-    st.markdown("Find identical and similar products across different grocery stores!")
+    st.title("🛒 Accurate Product Matching Across Stores")
+    st.markdown("Find **highly accurate** identical products across different grocery stores using advanced hybrid matching!")
+    
+    # Add info about the improved matching approach
+    with st.expander("ℹ️ How Our Improved Matching Works", expanded=False):
+        st.markdown("""
+        **Our hybrid approach ensures high accuracy by:**
+        1. ** Strict Filtering**: Only compares products with matching brand (fuzzy) and exact size
+        2. ** Smart Similarity**: Uses AI to compare product titles of pre-filtered candidates
+        3. ** High Threshold**: Only shows matches with 85%+ similarity for maximum accuracy
+        
+        **This prevents false matches like:**
+        -  Coca-Cola 1.25L matching with Coca-Cola 2L (different sizes)
+        -  Coca-Cola matching with Pepsi (different brands)
+        -  Only matches truly identical products across stores
+        """)
     
     # Sidebar for controls
     with st.sidebar:
-        st.header(" Data Statistics")
+        st.header("📊 Data Statistics")
         
         # Load data button
-        if st.button(" Reload Data"):
+        if st.button("🔄 Reload Data"):
             st.cache_data.clear()
             st.rerun()
     
@@ -611,16 +823,16 @@ def main():
                 st.write("**Category:**")
                 st.write(f" **Category:** {selected_product.get('mainCategoryName', 'N/A')}")
                 st.write(f" **Subcategory:** {selected_product.get('subCategoryName', 'N/A')}")
-                        # Find matchingproducts button
-            if st.button(" Find Matching Products", type="primary"):
-                with st.spinner(" Finding matching products across stores..."):
+            # Find matching products button
+            if st.button(" Find Accurate Matches", type="primary"):
+                with st.spinner("🔍 Finding highly accurate matches using hybrid approach..."):
                     matches = find_identical_products_across_stores(
                         selected_product, 
                         combined_df
                     )
                 
                 st.markdown("---")
-                st.header(" Matching Products Results")
+                st.header("📊 Accurate Matching Results")
                 display_matches_in_streamlit(matches, selected_product)
         else:
             st.info(" Please select a row from the table above to find matching products.")
